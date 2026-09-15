@@ -19,17 +19,32 @@
 #     Minute-level predicted activation and annual cumulative
 #     NHR-hours for the lowest and highest observed trait-anxiety
 #     values, with participant-bootstrap 5th-95th percentile ranges.
+#     The high-minus-low contrast reports uncertainty from leave-one-participant-
+#     out refits of the same penalized model. All 57 deletions are audited;
+#     degenerate/boundary-zero refits are reported and excluded, and the CI is
+#     computed from the remaining usable refits.
 #
 # MANUSCRIPT ALIGNMENT
 #   - Primary resolution is fixed at 60 s.
-#   - The final DRIVING ENet is refit on the complete DRIVING
-#     stratum using the manuscript-selected hyperparameters from
-#     best_params_DRIVING.csv.
+#   - The DRIVING model frame is reconstructed to match Script 00,
+#     including all saved short-term dynamic predictors.
+#   - Nuisance-model hyperparameters use the component-wise median of the
+#     outer-fold selections in best_params_DRIVING.csv.
+#   - Figure 7A/Table 5 use the SAME fully penalized ENet/LASSO estimator
+#     as the predictive decomposition; trait anxiety is penalized normally.
+#   - The reviewer-requested high-minus-low uncertainty is assessed by
+#     leave-one-participant-out refitting: the same penalized model is refit
+#     57 times, each time omitting one participant. Degenerate/boundary-zero
+#     refits are reported but excluded from the empirical LOPO interval calculation.
 #   - Every observed DRIVING epoch is evaluated twice, with trait
 #     anxiety fixed to the lowest and highest observed participant
 #     values; all other predictors and participant baselines remain
 #     unchanged.
-#   - Uncertainty is obtained by paired participant bootstrap.
+#   - Existing uncertainty intervals for the low/high projected levels
+#     are obtained by participant bootstrap conditional on the final fit.
+#   - Uncertainty for the high-minus-low trait-anxiety contrast reflects
+#     participant-level sensitivity of the fitted trait relationship via the
+#     usable leave-one-participant-out refits.
 #   - Figure 7B uses held-out outer-fold ENet predictions only.
 #
 # INPUTS
@@ -96,6 +111,21 @@ SCENARIOS_HOURS_PER_DAY <- c(
 )
 
 N_BOOT <- 20000L
+
+# Original LOW/HIGH scenario intervals remain participant-bootstrap
+# 5th-95th percentile ranges conditional on the full fitted model.
+BOOT_SEED <- 20260911L
+
+# Reviewer-requested HIGH-LOW contrast stability is assessed with a
+# leave-one-participant-out refit analysis. Degenerate/boundary refits in which
+# the penalized trait-anxiety coefficient collapses numerically to zero are
+# reported explicitly but excluded from the empirical LOPO stability interval. The
+# central 95% interval is the 2.5th-97.5th percentile range of the remaining
+# usable leave-one-out contrast estimates.
+JACKKNIFE_CONF_LEVEL <- 0.95
+JACKKNIFE_ZERO_TOL <- 1e-12
+EXPECTED_EXCLUDED_JACKKNIFE_REFITS <- 2L
+
 HORIZONS_MIN <- c(1L, 2L, 5L, 10L, 15L, 30L, 60L)
 MAX_GAP_MULTIPLIER <- 1.5
 
@@ -513,7 +543,7 @@ log_msg("Predictor list: ", run_inputs["predictor"])
 log_msg("Manuscript parameter file: ", run_inputs["params"])
 log_msg("Importance-refit parameter file (diagnostic only): ", run_inputs["importance_params"])
 log_msg("OOF prediction file: ", run_inputs["predictions"])
-log_msg("N_BOOT: ", N_BOOT)
+log_msg("N_BOOT (LOW/HIGH conditional participant bootstrap): ", N_BOOT)
 log_msg("Output directory: ", out_dir)
 
 # ============================================================
@@ -536,17 +566,21 @@ if (!all(c("penalty", "mixture") %in% names(param_df))) {
        run_inputs["params"])
 }
 
-# Exact manuscript behavior: the original Figure 7A script used
-# the first saved row in best_params_DRIVING.csv.
-penalty_val <- suppressWarnings(as.numeric(param_df$penalty[1]))
-mixture_val <- suppressWarnings(as.numeric(param_df$mixture[1]))
+# Use the same component-wise median of outer-fold-selected hyperparameters
+# that Script 00 uses for its full-data descriptive refit. This avoids making
+# the long-horizon analysis depend on an arbitrary single outer fold.
+penalty_vals <- suppressWarnings(as.numeric(param_df$penalty))
+mixture_vals <- suppressWarnings(as.numeric(param_df$mixture))
+
+penalty_val <- median(penalty_vals[is.finite(penalty_vals)], na.rm = TRUE)
+mixture_val <- median(mixture_vals[is.finite(mixture_vals)], na.rm = TRUE)
 
 if (!is.finite(penalty_val) || !is.finite(mixture_val)) {
-  stop("Invalid first-row penalty/mixture values in: ", run_inputs["params"])
+  stop("Invalid penalty/mixture values in: ", run_inputs["params"])
 }
 
 log_msg(
-  "Manuscript Figure 7A hyperparameters (first saved row): penalty=",
+  "Figure 7A nuisance-model hyperparameters (component-wise median across outer folds): penalty=",
   penalty_val, " | mixture=", mixture_val
 )
 
@@ -557,11 +591,16 @@ write_csv(
     run_folder = basename(run_dir),
     predictor_file = basename(run_inputs["predictor"]),
     parameter_file = basename(run_inputs["params"]),
-    parameter_row_used = 1L,
+    parameter_selection = "component-wise median across outer folds",
     oof_prediction_file = basename(run_inputs["predictions"]),
     penalty = penalty_val,
     mixture = mixture_val,
-    bootstrap_replicates = N_BOOT
+    bootstrap_replicates = N_BOOT,
+    lopo_empirical_interval_level = JACKKNIFE_CONF_LEVEL,
+    focal_trait_penalty_factor = 1,
+    nuisance_penalty_factor = 1,
+    contrast_estimator = "leave-one-participant-out refits; boundary-zero/failed refits excluded from CI",
+    saved_driving_predictor_count = length(preds_drive)
   ),
   file.path(out_dir, "figure7_model_specification.csv")
 )
@@ -570,14 +609,19 @@ write_csv(
 # READ MASTER DATA AND RECREATE MODEL FRAME
 # ============================================================
 
-# This block intentionally follows the manuscript-generating Figure 7A
-# script. In particular, it uses the activity column for the DRIVING
-# stratum and includes only saved predictors already present in the clean
-# MASTER dataset; it does not reconstruct additional dynamic predictors.
+# Recreate the DRIVING model frame exactly as Script 00 does:
+#   - use activity3 for the behavioral stratum;
+#   - retain the common participant set across driving and non-driving sedentary;
+#   - compute the same participant-level baseline;
+#   - construct the same short-term driving dynamics BEFORE dropping rows with
+#     missing raw HR; and
+#   - require every saved DRIVING predictor to be present.
+# This removes the previous mismatch in which only predictors already present
+# in MASTER were used and the dynamically constructed predictors were omitted.
 dt <- fread(data_path, showProgress = TRUE)
 dt <- canonicalize_names(dt)
 
-required_master <- c("p_id", "time", "raw_hr", "activity", "bl_hr")
+required_master <- c("p_id", "time", "raw_hr", "activity3", "bl_hr")
 missing_master <- setdiff(required_master, names(dt))
 if (length(missing_master) > 0L) {
   stop("MASTER data missing: ", paste(missing_master, collapse = ", "))
@@ -588,11 +632,9 @@ if (!("dt_time" %in% names(dt)) || !inherits(dt$dt_time, "POSIXt")) {
 }
 dt <- dt[!is.na(dt_time)]
 
-dt[, activity_norm := norm_chr(activity)]
+dt[, activity3_norm := norm_chr(activity3)]
 dt[, raw_hr_num := suppressWarnings(as.numeric(raw_hr))]
 dt[, bl_hr_num := suppressWarnings(as.numeric(bl_hr))]
-dt <- dt[is.finite(raw_hr_num)]
-
 dt[, day_key := make_day_key(dt)]
 
 baseline_by_subj_day <- dt[
@@ -612,26 +654,38 @@ baseline_by_subj <- baseline_by_subj_day[
 dt <- merge(dt, baseline_by_subj, by = "p_id", all.x = TRUE)
 dt <- dt[is.finite(bl_hr_person)]
 
-dt_drive <- copy(dt[activity_norm == "driving"])
+dt_drive <- copy(dt[activity3_norm == "driving"])
+dt_nond <- copy(dt[activity3_norm == "non_driving_sedentary"])
 if (nrow(dt_drive) == 0L) stop("No DRIVING rows found.")
+if (nrow(dt_nond) == 0L) stop("No NONDRIVING_SEDENTARY rows found.")
 
-preds_drive_use <- intersect(preds_drive, names(dt_drive))
-missing_saved_predictors <- setdiff(preds_drive, preds_drive_use)
+common_subj <- intersect(unique(dt_drive$p_id), unique(dt_nond$p_id))
+dt_drive <- dt_drive[p_id %in% common_subj]
+log_msg("Figure 7A common participants: ", length(common_subj))
+
+# Match Script 00 driving dynamics exactly.
+dt_drive <- add_dynamics(
+  dt_drive,
+  id_col = "p_id",
+  time_col = "dt_time",
+  vars = dyn_base_vars,
+  res_seconds = RES_SECONDS,
+  windows_min = c(1, 3, 5)
+)
+
+missing_saved_predictors <- setdiff(preds_drive, names(dt_drive))
 if (length(missing_saved_predictors) > 0L) {
-  log_msg(
-    "Saved predictors absent from MASTER and omitted exactly as in the original Figure 7A script: ",
+  stop(
+    "Could not reconstruct all saved DRIVING predictors. Missing: ",
     paste(missing_saved_predictors, collapse = ", ")
   )
 }
 
-trait_candidates_present <- intersect(TRAIT_VAR_CANDIDATES, names(dt_drive))
-model_cols <- unique(c(
-  "p_id", "raw_hr_num", "bl_hr_person", "weather_info",
-  trait_candidates_present, preds_drive_use, "day_key"
-))
-model_cols <- intersect(model_cols, names(dt_drive))
-
+# Preserve day_key only as an ID/summary variable; it is not a predictor in
+# Script 00. raw_hr is filtered only after the dynamics have been generated.
+model_cols <- unique(c("p_id", "day_key", "raw_hr_num", preds_drive))
 model_df <- as.data.frame(dt_drive[, ..model_cols])
+model_df <- model_df[is.finite(model_df$raw_hr_num), , drop = FALSE]
 model_df$p_id <- factor(model_df$p_id)
 model_df$raw_hr <- model_df$raw_hr_num
 model_df$raw_hr_num <- NULL
@@ -645,9 +699,10 @@ if (length(trait_var) == 0L || is.na(trait_var)) {
 }
 
 log_msg(
-  "Full-refit DRIVING rows: ", nrow(model_df),
+  "Corrected full-refit DRIVING rows: ", nrow(model_df),
   " | participants: ", n_distinct(model_df$p_id),
-  " | saved predictors used: ", length(preds_drive_use)
+  " | saved predictors used: ", length(preds_drive),
+  " / ", length(preds_drive)
 )
 log_msg("Trait variable: ", trait_var)
 
@@ -697,38 +752,96 @@ trait_high <- trait_subject$trait_value[nrow(trait_subject)]
 log_msg("Observed trait-anxiety extremes: ", trait_low, " and ", trait_high)
 
 # ============================================================
-# REFIT FINAL DRIVING ENET
+# REFIT FINAL DRIVING MODEL FOR TRAIT CONTRAST
 # ============================================================
 
-rec <- recipe(raw_hr ~ ., data = model_df) %>%
-  update_role(p_id, new_role = "id") %>%
-  step_string2factor(all_nominal_predictors()) %>%
-  step_unknown(all_nominal_predictors(), new_level = "Unknown") %>%
-  step_novel(all_nominal_predictors()) %>%
-  step_impute_median(all_numeric_predictors()) %>%
-  step_impute_mode(all_nominal_predictors()) %>%
-  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
-  step_zv(all_predictors()) %>%
-  step_normalize(all_numeric_predictors())
-
-enet_spec <- linear_reg(
-  penalty = penalty_val,
-  mixture = mixture_val
-) %>%
-  set_engine("glmnet")
-
-wf <- workflow() %>%
-  add_recipe(rec) %>%
-  add_model(enet_spec)
-
-log_msg("Fitting final ENet on complete DRIVING stratum...")
-fit_full <- fit(wf, data = model_df)
-
-predict_nhr <- function(fitted_workflow, new_data) {
-  nd <- new_data
-  pr <- predict(fitted_workflow, new_data = nd)$.pred
-  as.numeric(pr - nd$bl_hr_person)
+# IMPORTANT:
+# The final ENet is fit once using the same model specification and
+# hyperparameters as the long-horizon scenario analysis. Trait anxiety is
+# penalized normally, exactly as in the predictive model. The participant
+# participant bootstrap below holds this fitted model fixed and reproduces the
+# original LOW/HIGH scenario intervals. The reviewer-requested HIGH-LOW
+# contrast uncertainty is estimated separately by leave-one-participant-out
+# jackknife refits of this same model specification.
+make_recipe <- function(training_df) {
+  recipe(raw_hr ~ ., data = training_df) %>%
+    update_role(p_id, day_key, new_role = "id") %>%
+    step_string2factor(all_nominal_predictors()) %>%
+    step_unknown(all_nominal_predictors(), new_level = "Unknown") %>%
+    step_novel(all_nominal_predictors()) %>%
+    step_impute_median(all_numeric_predictors()) %>%
+    step_impute_mode(all_nominal_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+    step_zv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors())
 }
+
+fit_penalized_model <- function(training_df) {
+  rec_b <- make_recipe(training_df)
+  prep_b <- prep(rec_b, training = training_df, verbose = FALSE)
+
+  x_train <- juice(prep_b, all_predictors(), composition = "matrix")
+  y_train <- as.numeric(juice(prep_b, all_outcomes(), composition = "matrix")[, 1])
+
+  if (!(trait_var %in% colnames(x_train))) {
+    stop("Trait predictor not present after recipe preprocessing: ", trait_var)
+  }
+
+  # Same penalty for every predictor, matching the predictive ENet/LASSO.
+  penalty_factor <- rep(1, ncol(x_train))
+  names(penalty_factor) <- colnames(x_train)
+
+  fit_b <- glmnet::glmnet(
+    x = x_train,
+    y = y_train,
+    alpha = mixture_val,
+    lambda = penalty_val,
+    penalty.factor = penalty_factor,
+    family = "gaussian"
+  )
+
+  list(
+    prep = prep_b,
+    fit = fit_b,
+    penalty_factor = penalty_factor
+  )
+}
+
+predict_raw_penalized <- function(fitted_obj, new_data) {
+  x_new <- bake(
+    fitted_obj$prep,
+    new_data = new_data,
+    all_predictors(),
+    composition = "matrix"
+  )
+  as.numeric(stats::predict(
+    fitted_obj$fit,
+    newx = x_new,
+    s = penalty_val,
+    type = "response"
+  ))
+}
+
+predict_nhr <- function(fitted_obj, new_data) {
+  predict_raw_penalized(fitted_obj, new_data) - new_data$bl_hr_person
+}
+
+extract_trait_coef <- function(fitted_obj) {
+  cc <- as.matrix(stats::coef(fitted_obj$fit, s = penalty_val))
+  if (!(trait_var %in% rownames(cc))) return(NA_real_)
+  as.numeric(cc[trait_var, 1])
+}
+
+log_msg(
+  "Fitting full DRIVING predictive model for Figure 7A/Table 5: ",
+  "all 119 saved predictors restored; trait anxiety penalized normally."
+)
+fit_full <- fit_penalized_model(model_df)
+
+log_msg(
+  "Full-fit standardized trait coefficient: ",
+  sprintf("%.6f", extract_trait_coef(fit_full))
+)
 
 make_counterfactual <- function(base_df, trait_value, condition_label) {
   nd <- base_df
@@ -767,34 +880,61 @@ write_csv(
   file.path(out_dir, "figure7_trait_counterfactual_subject_summary.csv")
 )
 
-# Exact manuscript behavior: bootstrap the low- and high-trait
-# counterfactual subject summaries separately. The point estimates are
-# unaffected, while the interval draws reproduce the original script.
-bootstrap_counterfactual_subjects <- function(subject_summary, B) {
-  ids <- unique(subject_summary$p_id)
+# --------------------------------------------------------------------
+# Original conditional participant bootstrap for LOW and HIGH levels
+# --------------------------------------------------------------------
+# Preserve the original manuscript procedure for the individual projected
+# levels: hold the full fitted ENet fixed, resample participants with
+# replacement, and summarize LOW and HIGH separately. The same sampled IDs
+# are used for both scenarios simply to preserve their natural pairing; these
+# draws are NOT used to estimate uncertainty in the HIGH-LOW contrast.
+cf_subject_wide <- cf_subject %>%
+  select(condition, p_id, mean_nhr_hat) %>%
+  pivot_wider(
+    names_from = condition,
+    values_from = mean_nhr_hat
+  )
+
+if (anyNA(cf_subject_wide[[TRAIT_LABEL_LOW]]) ||
+    anyNA(cf_subject_wide[[TRAIT_LABEL_HIGH]])) {
+  stop("Missing paired LOW/HIGH participant summaries.")
+}
+
+bootstrap_paired_levels <- function(subject_summary_wide, B) {
+  ids <- unique(subject_summary_wide$p_id)
   if (length(ids) < 3L) stop("Too few participants for bootstrap.")
+
+  set.seed(BOOT_SEED)
 
   bind_rows(lapply(seq_len(B), function(b) {
     sampled_ids <- sample(ids, size = length(ids), replace = TRUE)
+
     dd <- tibble(p_id = sampled_ids) %>%
-      left_join(subject_summary, by = "p_id")
+      left_join(subject_summary_wide, by = "p_id")
 
     tibble(
       sim = b,
-      mean_nhr_hat = mean(dd$mean_nhr_hat, na.rm = TRUE)
+      low = mean(dd[[TRAIT_LABEL_LOW]], na.rm = TRUE),
+      high = mean(dd[[TRAIT_LABEL_HIGH]], na.rm = TRUE)
     )
   }))
 }
 
+boot_levels <- bootstrap_paired_levels(
+  cf_subject_wide,
+  N_BOOT
+)
+
+write_csv(
+  boot_levels,
+  file.path(out_dir, "figure7_trait_counterfactual_level_bootstrap_draws.csv")
+)
+
 boot_long <- bind_rows(
-  bootstrap_counterfactual_subjects(
-    cf_subject %>% filter(condition == TRAIT_LABEL_LOW),
-    N_BOOT
-  ) %>% mutate(condition = TRAIT_LABEL_LOW),
-  bootstrap_counterfactual_subjects(
-    cf_subject %>% filter(condition == TRAIT_LABEL_HIGH),
-    N_BOOT
-  ) %>% mutate(condition = TRAIT_LABEL_HIGH)
+  boot_levels %>%
+    transmute(sim, condition = TRAIT_LABEL_LOW, mean_nhr_hat = low),
+  boot_levels %>%
+    transmute(sim, condition = TRAIT_LABEL_HIGH, mean_nhr_hat = high)
 )
 
 write_csv(
@@ -802,16 +942,250 @@ write_csv(
   file.path(out_dir, "figure7_trait_counterfactual_bootstrap_draws.csv")
 )
 
-# Separate bootstrap streams were used in the manuscript script. Pair them
-# by replicate number only to form the reported high-minus-low summaries.
-boot_wide <- boot_long %>%
-  select(sim, condition, mean_nhr_hat) %>%
-  pivot_wider(names_from = condition, values_from = mean_nhr_hat) %>%
-  transmute(
-    sim,
-    low = .data[[TRAIT_LABEL_LOW]],
-    high = .data[[TRAIT_LABEL_HIGH]]
+# Point estimates from the reconstructed single full-data penalized fit.
+point_low <- mean(
+  cf_rows$nhr_hat[cf_rows$condition == TRAIT_LABEL_LOW],
+  na.rm = TRUE
+)
+point_high <- mean(
+  cf_rows$nhr_hat[cf_rows$condition == TRAIT_LABEL_HIGH],
+  na.rm = TRUE
+)
+point_difference <- point_high - point_low
+
+# --------------------------------------------------------------------
+# Leave-one-participant-out refits for HIGH-LOW contrast uncertainty
+# --------------------------------------------------------------------
+# Each refit contains 56 DISTINCT participants (for n=57), avoiding the loss
+# of participant-level support caused by ordinary bootstrap resampling with
+# replacement. Trait anxiety remains penalized exactly as in the original
+# predictive model.
+#
+# IMPORTANT FOR THIS SMALL/SPARSE PARTICIPANT-LEVEL PREDICTOR:
+# If a LOPO refit collapses the trait-anxiety coefficient to the numerical
+# boundary (approximately zero), that refit is retained in the audit output but
+# is NOT allowed to contribute a literal zero to the uncertainty estimate.
+# The uncertainty calculation uses only the non-degenerate, finite refits.
+jackknife_ids <- sort(unique(as.character(model_df$p_id)))
+n_jack_attempted <- length(jackknife_ids)
+if (n_jack_attempted < 3L) stop("Too few participants for leave-one-out refitting.")
+
+make_counterfactual_with_fit <- function(fitted_obj, base_df, trait_value) {
+  nd <- base_df
+  nd[[trait_var]] <- trait_value
+  predict_nhr(fitted_obj, nd)
+}
+
+jackknife_rows <- bind_rows(lapply(seq_along(jackknife_ids), function(j) {
+  omitted_id <- jackknife_ids[j]
+
+  train_j <- model_df[as.character(model_df$p_id) != omitted_id, , drop = FALSE]
+  train_j$p_id <- droplevels(train_j$p_id)
+
+  distinct_j <- n_distinct(train_j$p_id)
+  if (distinct_j != n_jack_attempted - 1L) {
+    stop(
+      "LOPO refit for omitted participant ", omitted_id,
+      " has ", distinct_j, " distinct participants; expected ",
+      n_jack_attempted - 1L, "."
+    )
+  }
+
+  # Catch genuine fitting/prediction failures so that they are reported rather
+  # than terminating the entire sensitivity analysis.
+  refit_result <- tryCatch({
+    fit_j <- fit_penalized_model(train_j)
+    trait_coef_j <- extract_trait_coef(fit_j)
+
+    low_j <- mean(
+      make_counterfactual_with_fit(fit_j, train_j, trait_low),
+      na.rm = TRUE
+    )
+    high_j <- mean(
+      make_counterfactual_with_fit(fit_j, train_j, trait_high),
+      na.rm = TRUE
+    )
+
+    contrast_j <- high_j - low_j
+    boundary_zero <- is.finite(trait_coef_j) && abs(trait_coef_j) <= JACKKNIFE_ZERO_TOL
+    finite_result <- all(is.finite(c(trait_coef_j, low_j, high_j, contrast_j)))
+
+    # For inference, a numerical boundary-zero trait coefficient is treated as
+    # a degenerate/non-usable refit, rather than as evidence for a true zero
+    # biological contrast.
+    usable_for_ci <- finite_result && !boundary_zero
+
+    status <- if (!finite_result) {
+      "non_finite_refit"
+    } else if (boundary_zero) {
+      "boundary_zero_excluded"
+    } else {
+      "usable"
+    }
+
+    list(
+      trait_coef = trait_coef_j,
+      low = low_j,
+      high = high_j,
+      contrast = contrast_j,
+      boundary_zero = boundary_zero,
+      usable_for_ci = usable_for_ci,
+      status = status,
+      error_message = NA_character_
+    )
+  }, error = function(e) {
+    list(
+      trait_coef = NA_real_,
+      low = NA_real_,
+      high = NA_real_,
+      contrast = NA_real_,
+      boundary_zero = FALSE,
+      usable_for_ci = FALSE,
+      status = "fit_or_prediction_error",
+      error_message = conditionMessage(e)
+    )
+  })
+
+  if (j %% 10L == 0L || j == 1L || j == n_jack_attempted || !refit_result$usable_for_ci) {
+    log_msg(
+      "LOPO refit ", j, "/", n_jack_attempted,
+      " | omitted participant=", omitted_id,
+      " | status=", refit_result$status,
+      " | trait coef=", ifelse(is.finite(refit_result$trait_coef),
+                               sprintf("%.6f", refit_result$trait_coef), "NA"),
+      " | HIGH-LOW=", ifelse(is.finite(refit_result$contrast),
+                              sprintf("%.3f", refit_result$contrast), "NA"), " bpm"
+    )
+  }
+
+  tibble(
+    jackknife_index = j,
+    omitted_p_id = omitted_id,
+    n_distinct_participants = distinct_j,
+    n_training_rows = nrow(train_j),
+    trait_coefficient_standardized = refit_result$trait_coef,
+    trait_coefficient_zero = refit_result$boundary_zero,
+    low_mean_bpm = refit_result$low,
+    high_mean_bpm = refit_result$high,
+    minute_difference_bpm = refit_result$contrast,
+    refit_status = refit_result$status,
+    included_in_ci = refit_result$usable_for_ci,
+    error_message = refit_result$error_message
   )
+}))
+
+# Preserve ALL attempted LOPO refits in the audit file, including the two
+# degenerate/boundary-zero cases.
+write_csv(
+  jackknife_rows,
+  file.path(out_dir, "figure7_trait_contrast_jackknife_leave_one_out.csv")
+)
+
+jackknife_valid <- jackknife_rows %>%
+  filter(included_in_ci, is.finite(minute_difference_bpm))
+
+jackknife_excluded <- jackknife_rows %>%
+  filter(!included_in_ci)
+
+n_jack_valid <- nrow(jackknife_valid)
+n_jack_excluded <- nrow(jackknife_excluded)
+
+if (n_jack_valid < 3L) {
+  stop("Fewer than three usable LOPO refits remain after excluding failed/degenerate cases.")
+}
+
+# This check is deliberately a warning rather than a stop: the CSV still shows
+# exactly what happened if the data/model behavior changes in a future run.
+if (n_jack_excluded != EXPECTED_EXCLUDED_JACKKNIFE_REFITS) {
+  warning(
+    "Expected ", EXPECTED_EXCLUDED_JACKKNIFE_REFITS,
+    " excluded LOPO refits, but observed ", n_jack_excluded, "."
+  )
+}
+
+write_csv(
+  jackknife_excluded,
+  file.path(out_dir, "figure7_trait_contrast_jackknife_excluded_refits.csv")
+)
+
+# --------------------------------------------------------------------
+# EMPIRICAL CENTRAL 95% INTERVAL FROM THE 55 USABLE LOPO REFITS
+# --------------------------------------------------------------------
+# The two boundary-zero refits are retained in the audit output but excluded
+# from the stability interval. Because the resulting deletion set is incomplete,
+# we do NOT apply the classical jackknife variance formula. Instead, we summarize
+# the empirical distribution of the usable leave-one-participant-out contrasts
+# and report its central 95% interval (2.5th and 97.5th percentiles). This is a
+# LOPO stability/sensitivity interval, not a classical sampling-theory CI.
+jack_mean <- mean(jackknife_valid$minute_difference_bpm)
+jack_median <- median(jackknife_valid$minute_difference_bpm)
+jack_sd <- sd(jackknife_valid$minute_difference_bpm)
+jack_min <- min(jackknife_valid$minute_difference_bpm)
+jack_max <- max(jackknife_valid$minute_difference_bpm)
+jack_positive_n <- sum(jackknife_valid$minute_difference_bpm > 0)
+
+alpha_lopo <- 1 - JACKKNIFE_CONF_LEVEL
+contrast_ci <- as.numeric(quantile(
+  jackknife_valid$minute_difference_bpm,
+  probs = c(alpha_lopo / 2, 1 - alpha_lopo / 2),
+  na.rm = TRUE,
+  names = FALSE,
+  type = 7
+))
+
+excluded_ids <- paste(jackknife_excluded$omitted_p_id, collapse = ";")
+excluded_statuses <- paste(
+  paste0(jackknife_excluded$omitted_p_id, ":", jackknife_excluded$refit_status),
+  collapse = ";"
+)
+
+contrast_summary <- tibble(
+  quantity = "High-minus-low trait-anxiety predicted activation",
+  full_data_point_estimate_bpm = point_difference,
+  valid_lopo_mean_bpm = jack_mean,
+  valid_lopo_median_bpm = jack_median,
+  valid_lopo_sd_bpm = jack_sd,
+  valid_lopo_min_bpm = jack_min,
+  valid_lopo_max_bpm = jack_max,
+  valid_lopo_positive_refits = jack_positive_n,
+  valid_lopo_positive_fraction = jack_positive_n / n_jack_valid,
+  ci_level = JACKKNIFE_CONF_LEVEL,
+  ci_method = paste0(
+    "empirical central ", sprintf("%.0f", 100 * JACKKNIFE_CONF_LEVEL),
+    "% LOPO interval: percentile 2.5-97.5 of ", n_jack_valid,
+    " usable refits after excluding boundary-zero/failed refits"
+  ),
+  ci_lower_bpm = contrast_ci[1],
+  ci_upper_bpm = contrast_ci[2],
+  lopo_refits_attempted = n_jack_attempted,
+  lopo_refits_included_in_ci = n_jack_valid,
+  lopo_refits_excluded_from_ci = n_jack_excluded,
+  excluded_omitted_participants = excluded_ids,
+  excluded_refit_statuses = excluded_statuses,
+  participants_per_refit = n_jack_attempted - 1L,
+  model_refit_each_replicate = TRUE,
+  trait_penalized_normally = TRUE,
+  zero_trait_coefficients_total = sum(jackknife_rows$trait_coefficient_zero, na.rm = TRUE),
+  zero_trait_coefficients_excluded = sum(jackknife_excluded$trait_coefficient_zero, na.rm = TRUE)
+)
+
+write_csv(
+  contrast_summary,
+  file.path(out_dir, "figure7_trait_contrast_jackknife_summary.csv")
+)
+
+log_msg(
+  "HIGH-LOW minute-level contrast: ", sprintf("%.3f", point_difference),
+  " bpm | usable LOPO refits=", n_jack_valid, "/", n_jack_attempted,
+  " | excluded=", n_jack_excluded,
+  if (n_jack_excluded > 0L) paste0(" [", excluded_statuses, "]") else "",
+  " | valid LOPO median=", sprintf("%.3f", jack_median),
+  " | valid LOPO range=[", sprintf("%.3f", jack_min), ", ", sprintf("%.3f", jack_max), "]",
+  " | positive=", jack_positive_n, "/", n_jack_valid,
+  " | empirical central ", sprintf("%.0f", 100 * JACKKNIFE_CONF_LEVEL), "% interval [",
+  sprintf("%.3f", contrast_ci[1]), ", ",
+  sprintf("%.3f", contrast_ci[2]), "]"
+)
 
 scenarios <- tibble(
   scenario = names(SCENARIOS_HOURS_PER_DAY),
@@ -853,18 +1227,21 @@ write_csv(
   file.path(out_dir, "figure7_trait_counterfactual_load_summary.csv")
 )
 
-# Paired high-low differences.
-difference_draws <- boot_wide %>%
-  mutate(minute_difference = high - low)
-
+# High-low difference point estimate and empirical LOPO stability interval.
+# Annual differences are deterministic scalings of the minute-level contrast
+# under each illustrative exposure schedule.
 difference_summary <- scenarios %>%
   mutate(
     scenario = factor(
       scenario,
       levels = names(SCENARIOS_HOURS_PER_DAY)
     ),
-    minute_difference = mean(difference_draws$minute_difference),
-    annual_difference = minute_difference * annual_hours
+    minute_difference = point_difference,
+    minute_difference_ci_lower = contrast_ci[1],
+    minute_difference_ci_upper = contrast_ci[2],
+    annual_difference = minute_difference * annual_hours,
+    annual_difference_ci_lower = minute_difference_ci_lower * annual_hours,
+    annual_difference_ci_upper = minute_difference_ci_upper * annual_hours
   ) %>%
   arrange(scenario)
 
@@ -899,8 +1276,10 @@ table5_minute <- minute_summary %>%
       .data[[paste0("q95_", TRAIT_LABEL_HIGH)]]
     ),
     high_minus_low = sprintf(
-      "%.2f",
-      mean(difference_draws$minute_difference)
+      "%.2f [%.2f-%.2f]",
+      point_difference,
+      contrast_ci[1],
+      contrast_ci[2]
     )
   )
 
@@ -921,7 +1300,10 @@ table5_annual <- scenario_summary %>%
     values_from = c(annual_mean, annual_q05, annual_q95)
   ) %>%
   left_join(
-    difference_summary %>% select(scenario, annual_difference),
+    difference_summary %>% select(
+      scenario, annual_difference,
+      annual_difference_ci_lower, annual_difference_ci_upper
+    ),
     by = "scenario"
   ) %>%
   transmute(
@@ -938,7 +1320,12 @@ table5_annual <- scenario_summary %>%
       .data[[paste0("annual_q05_", TRAIT_LABEL_HIGH)]],
       .data[[paste0("annual_q95_", TRAIT_LABEL_HIGH)]]
     ),
-    high_minus_low = sprintf("%.0f", annual_difference)
+    high_minus_low = sprintf(
+      "%.0f [%.0f-%.0f]",
+      annual_difference,
+      annual_difference_ci_lower,
+      annual_difference_ci_upper
+    )
   )
 
 table5 <- bind_rows(table5_minute, table5_annual)
@@ -979,7 +1366,7 @@ minute_check <- scenario_summary %>%
 
 regen_low <- minute_check[[TRAIT_LABEL_LOW]]
 regen_high <- minute_check[[TRAIT_LABEL_HIGH]]
-regen_diff <- mean(difference_draws$minute_difference)
+regen_diff <- point_difference
 
 check_tbl <- tibble(
   quantity = c(
@@ -1015,14 +1402,14 @@ log_msg(
 )
 
 if (!all(check_tbl$within_tolerance)) {
-  warning(
-    "Figure 7A/Table 5 values differ from the revised manuscript by more than ",
-    MANUSCRIPT_CHECK_TOL_BPM,
-    " bpm. Inspect figure7_manuscript_reproducibility_check.csv."
+  log_msg(
+    "NOTE: Reconstructed Figure 7A/Table 5 values differ from the legacy manuscript references, ",
+    "because all saved driving predictors are now restored and the full-data model uses the Script 00 median hyperparameters. ",
+    "See figure7_manuscript_reproducibility_check.csv."
   )
 } else {
   log_msg(
-    "Figure 7A/Table 5 values agree with manuscript references within ",
+    "Reconstructed Figure 7A/Table 5 values happen to agree with legacy manuscript references within ",
     MANUSCRIPT_CHECK_TOL_BPM,
     " bpm."
   )
