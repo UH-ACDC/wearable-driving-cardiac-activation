@@ -28,7 +28,7 @@ The repository reproduces every analysis reported in the manuscript, including:
 - baseline-referenced operating-regime analysis,
 - predictive decomposition using nested grouped cross-validation,
 - elastic-net modulator analysis,
-- long-horizon scenario projections,
+- long-horizon scenario projections and trait-anxiety contrast uncertainty analysis,
 - supplementary heart-rate missingness analyses,
 - supplementary participant-level physiological traces.
 
@@ -47,8 +47,6 @@ The repository reproduces every analysis reported in the manuscript, including:
 │   ├── 07_figure7_table5_long_horizon_scenarios.R
 │   ├── 08_supplementary_tableS1_hr_missingness_analysis.R
 │   └── 09_supplementary_figureS1_participant_traces.R
-│
-├── Results/
 │
 ├── README.md
 ├── LICENSE
@@ -115,7 +113,7 @@ The principal scripts should be executed sequentially.
 |---------|----------------|
 | 00 | Nested grouped cross-validation and predictive decomposition |
 | 01–06 | Figures 1–6 and associated manuscript tables |
-| 07 | Figure 7 and long-horizon scenario analyses |
+| 07 | Figure 7, Table 5, long-horizon scenario projections, and uncertainty analysis of the trait-anxiety contrast |
 | 08 | Supplementary Table S1 (heart-rate missingness analyses) |
 | 09 | Supplementary Figure S1 (participant-level HR traces) |
 
@@ -185,7 +183,7 @@ The repository also reproduces
 
 ---
 
-## Software requirements
+# Software requirements
 
 The analyses were developed in R. R version 4.6 or later is recommended.
 
